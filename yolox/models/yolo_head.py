@@ -252,6 +252,204 @@ class YOLOXHead(nn.Module):
         ], dim=-1)
         return outputs
 
+    def convert_xywh_to_xyxy(self, bboxes):
+        """
+        Convert bounding boxes from (center_x, center_y, width, height) to (x1, y1, x2, y2),
+        assuming the coordinates are normalized to the range [0, 1].
+
+        Args:
+        bboxes (Tensor): A tensor containing bounding boxes of shape (N, 4),
+                        where N is the number of bounding boxes and each bounding box
+                        is defined as (center_x, center_y, width, height) normalized by image dimensions.
+
+        Returns:
+        Tensor: Converted bounding boxes of shape (N, 4), where each bounding box
+            is defined as (x1, y1, x2, y2) also in normalized format.
+        """
+        x1 = bboxes[:, 0] - 0.5 * bboxes[:, 2]
+        y1 = bboxes[:, 1] - 0.5 * bboxes[:, 3]
+        x2 = bboxes[:, 0] + 0.5 * bboxes[:, 2]
+        y2 = bboxes[:, 1] + 0.5 * bboxes[:, 3]
+
+        return torch.stack([x1, y1, x2, y2], dim=1)
+
+    def normalized_areas_of_contained_bboxes(self, cell_tensor, table_tensor, modifier=0, bottom_modifier=0):
+        """
+        Computes the normalized sum of the areas of bounding boxes that are completely contained
+        within each bounding box in a tensor of multiple table bounding boxes.
+
+        Args:
+        cell_tensor (torch.Tensor): Tensor of shape (N, 4) representing bounding boxes.
+        table_tensor (torch.Tensor): Tensor of shape (M, 4) representing multiple table bounding boxes.
+        modifier (int): The modifier to add to each coordinate of the table bounding box.
+
+        Returns:
+        torch.Tensor: Tensor of normalized sums of the areas for each table bounding box.
+        """
+        normalized_areas = []
+
+        for table_bbox in table_tensor:
+            # Modify the table_bbox by adding the modifier to each coordinate
+            table_bbox = table_bbox + modifier
+            # Modify the y2 coordinate of the table_bbox by adding the bottom_modifier
+            table_bbox[3] = table_bbox[3] + bottom_modifier
+            # Check if the top-left corner of each bbox is within the current table_bbox
+            top_left_inside = (cell_tensor[:, 0] >= table_bbox[0]) & (cell_tensor[:, 1] >= table_bbox[1])
+            
+            # Check if the bottom-right corner of each bbox is within the current table_bbox
+            bottom_right_inside = (cell_tensor[:, 2] <= table_bbox[2]) & (cell_tensor[:, 3] <= table_bbox[3])
+            
+            # Combine both conditions to filter the tensor
+            contained = top_left_inside & bottom_right_inside
+            contained_bboxes = cell_tensor[contained]
+
+            # Calculate the area of each contained bbox: (x2 - x1) * (y2 - y1)
+            areas = (contained_bboxes[:, 2] - contained_bboxes[:, 0]) * (contained_bboxes[:, 3] - contained_bboxes[:, 1])
+
+            # Sum the areas
+            total_area = areas.sum()
+
+            # Calculate the area of the current table_bbox: (x2 - x1) * (y2 - y1)
+            table_area = (table_bbox[2] - table_bbox[0]) * (table_bbox[3] - table_bbox[1])
+
+            # Normalize the total area by the area of the current table_bbox
+            normalized_area = total_area / table_area if table_area != 0 else 0  # Avoid division by zero
+            normalized_areas.append(normalized_area.item())
+
+        return torch.tensor(normalized_areas)  # Convert to a tensor for output
+
+    def check_cells_in_expanded_areas(cell_tensor, table_tensor, inner_margin=5, outer_margin=10):
+        """
+        Checks if the area just outside of each table bounding box contains any cells.
+        
+        Args:
+        cell_tensor (torch.Tensor): Tensor of shape (N, 4) representing cell bounding boxes.
+        table_tensor (torch.Tensor): Tensor of shape (M, 4) representing table bounding boxes.
+        inner_margin (int): Inner margin for expanding the table bounding boxes.
+        mu3 (int): Outer margin for further expanding the table bounding boxes.
+
+        Returns:
+        torch.Tensor: Boolean tensor indicating if the area between inner_margin and outer_margin expansions contains any cells.
+        """
+        results = []
+
+        for table_bbox in table_tensor:
+            # Expand table_bbox by inner_margin and outer_margin
+            inner_expanded_bbox = torch.tensor([table_bbox[0] - inner_margin, table_bbox[1] - inner_margin, 
+                                                table_bbox[2] + inner_margin, table_bbox[3] + inner_margin])
+            outer_expanded_bbox = torch.tensor([table_bbox[0] - outer_margin, table_bbox[1] - outer_margin, 
+                                                table_bbox[2] + outer_margin, table_bbox[3] + outer_margin])
+
+            # Check for any cell in the inner_margin expanded area
+            in_inner = (cell_tensor[:, 0] >= inner_expanded_bbox[0]) & (cell_tensor[:, 1] >= inner_expanded_bbox[1]) & \
+                    (cell_tensor[:, 2] <= inner_expanded_bbox[2]) & (cell_tensor[:, 3] <= inner_expanded_bbox[3])
+
+            # Check for any cell in the outer_margin expanded area
+            in_outer = (cell_tensor[:, 0] >= outer_expanded_bbox[0]) & (cell_tensor[:, 1] >= outer_expanded_bbox[1]) & \
+                    (cell_tensor[:, 2] <= outer_expanded_bbox[2]) & (cell_tensor[:, 3] <= outer_expanded_bbox[3])
+
+            # Check for cells that are in the outer area but not in the inner area
+            contains_cells_in_area = (in_outer & ~in_inner).any() # This will be a boolean
+
+            results.append(contains_cells_in_area)
+
+        return torch.tensor(results)
+    
+
+    def prep_tensors_for_constraint_loss(self, fg_masked_cls_preds, fg_masked_bbox_preds, fg_masked_obj_preds):
+        """
+        Prepare tensors for constraint loss by filtering bounding boxes based on confidence and converting their format.
+
+        Args:
+        fg_masked_cls_preds (torch.Tensor): Foreground masked class predictions.
+        fg_masked_bbox_preds (torch.Tensor): Foreground masked bounding box predictions.
+        fg_masked_obj_preds (torch.Tensor): Foreground masked objectness predictions.
+
+        Returns:
+        tuple: A tuple containing:
+            - fg_masked_bbox_pred_tables_xyxy (torch.Tensor): Bounding boxes for tables converted to xyxy format.
+            - fg_masked_high_conf_bbox_pred_cells_xyxy (torch.Tensor): High confidence bounding boxes for cells converted to xyxy format.
+            - fg_masked_obj_preds_tables (torch.Tensor): Objectness scores for tables.
+        """
+        # Get the tables and cells, assuming tables are class 0 and cells class 1
+        _, predicted_classes = torch.max(fg_masked_cls_preds, dim=1)
+        indices_tables = (predicted_classes == 0)
+        indices_cells = (predicted_classes == 1)
+
+        fg_masked_bbox_preds_tables = fg_masked_bbox_preds[indices_tables]
+        fg_masked_obj_preds_tables = fg_masked_obj_preds[indices_tables]
+        fg_masked_bbox_preds_cells = fg_masked_bbox_preds[indices_cells]
+
+
+        obj_conf_cells = fg_masked_obj_preds[indices_cells]
+        class_conf_cells = fg_masked_cls_preds[indices_cells, 1].unsqueeze(1)  # Assuming 1 is the index for 'cells'
+        
+        # Only want to use high confidence cells for constraint loss
+        combined_conf_cells = obj_conf_cells * class_conf_cells
+        high_conf_indices = combined_conf_cells >= 0.5  # Confidence threshold
+        high_conf_bbox_cells = fg_masked_bbox_preds_cells[high_conf_indices.squeeze()]
+
+        fg_masked_bbox_pred_tables_xyxy = self.convert_xywh_to_xyxy(fg_masked_bbox_preds_tables)
+        fg_masked_high_conf_bbox_pred_cells_xyxy = self.convert_xywh_to_xyxy(high_conf_bbox_cells)
+        
+
+        return fg_masked_bbox_pred_tables_xyxy, fg_masked_high_conf_bbox_pred_cells_xyxy, fg_masked_obj_preds_tables
+
+
+    def constraint_loss(self, cell_tensor, table_tensor, table_objectness_tensor, mu1=5, mu2=5, mu3=10, mu4=-10, alpha=0.125, gamma=0.1):
+        """
+        Computes the constraint loss.
+
+        Adapted from: Global Table Extractor (GTE): A Framework for Joint Table Identification and Cell Structure Recognition Using Visual Context
+        https://arxiv.org/pdf/2005.00589v2
+
+        Args:
+        cell_tensor (torch.Tensor): Tensor of shape (N, 4) representing cell bounding boxes. x1y1x2y2 format
+        table_tensor (torch.Tensor): Tensor of shape (M, 4) representing table bounding boxes. x1y1x2y2 format
+        table_objectness_tensor (torch.Tensor): Tensor of shape (M, 1) representing the objectness score for each table bounding box.
+        mu1 (int): The margin to add to the table bounding box (used in penalty 2)
+        mu2 (int): The inner margin to select the area just outside the table bounding box (used in penalty 3)
+        mu3 (int): The outer margin to select the area just outside the table bounding box (used in penalty 3)
+        mu4 (int): The margin to add to the bottom of the table bounding box (used in penalty 4)
+        alpha (float): The weight for the first term in the constraint loss.
+        gamma (float): The weight for the second term in the constraint loss.
+
+        Returns:
+        torch.Tensor: The constraint loss.
+        """
+        # validate that the table_tensor and the table_objectness_tensor have the same number of rows
+        if table_tensor.size(0) != table_objectness_tensor.size(0):
+            raise ValueError("The table_tensor and the table_objectness_tensor must have the same number of rows.")
+        # instantiate this now to enable penalty calculation later based on if statement - should probably create a sepearte function for penalty calculation
+        penalty = None
+        # if cell_tensor is empty, then the penalty is 1
+        if cell_tensor.size(0) == 0:
+            # if there are no cells, then the penalty is one
+            penalty = torch.ones(table_tensor.size(0)).float()
+        if table_tensor.size(0) == 0:
+            # if there are no tables, then the penalty is 0
+            penalty = torch.tensor(0.)
+        if penalty is None:
+            # if the area_of_cells_in_tables is less than alpha then the penalty is 1, otherwise 0
+            area_of_cells_in_tables = self.normalized_areas_of_contained_bboxes(cell_tensor, table_tensor, modifier=0, bottom_modifier=0)
+            penalty_1 = area_of_cells_in_tables < alpha
+            # if the area_of_cells_just_inside_tables is less than alpha then the penalty is 1, otherwise 0
+            area_of_cells_just_inside_tables = self.normalized_areas_of_contained_bboxes(cell_tensor, table_tensor, modifier=mu1, bottom_modifier=0)
+            penalty_2 = area_of_cells_just_inside_tables < alpha
+            # if the area just outside the table contains any cells then the penalty is 1, otherwise 0
+            penalty_3 = self.check_cells_in_expanded_areas(cell_tensor, table_tensor, inner_margin=mu2, outer_margin=mu3)
+            # if the area_of_cells_just_inside_bottom_tables is less than alpha then the penalty is 1, otherwise 0
+            area_of_cells_just_inside_bottom_tables = self.normalized_areas_of_contained_bboxes(cell_tensor, table_tensor, modifier=0, bottom_modifier=mu4)
+            penalty_4 = area_of_cells_just_inside_bottom_tables < alpha
+            # perform OR operation on all the boolean penalties
+            penalty = penalty_1 | penalty_2 | penalty_3 | penalty_4
+            # convert penalty to float - will be 1 or 0
+            penalty = penalty.float()
+        # calculate loss
+        constraint_loss = (penalty * table_objectness_tensor) + (gamma * (1 - penalty) * (1 - table_objectness_tensor))
+        constraint_loss = constraint_loss.sum()
+        return constraint_loss
+
     def get_losses(
         self,
         imgs,
@@ -382,15 +580,24 @@ class YOLOXHead(nn.Module):
             l1_targets = torch.cat(l1_targets, 0)
 
         num_fg = max(num_fg, 1)
+        fg_masked_bbox_preds = bbox_preds.view(-1, 4)[fg_masks]
+        fg_masked_obj_preds = obj_preds.view(-1, 1)[fg_masks]
+        fg_masked_cls_preds = cls_preds.view(-1, self.num_classes)[fg_masks]
+        # prep function
+        fg_masked_bbox_pred_tables_xyxy, fg_masked_high_conf_bbox_pred_cells_xyxy, fg_masked_obj_preds_tables = self.prep_tensors_for_constraint_loss(fg_masked_cls_preds, fg_masked_bbox_preds, fg_masked_obj_preds)
+        # calculate the constraint loss
+        constraint_loss = self.constraint_loss(fg_masked_high_conf_bbox_pred_cells_xyxy, fg_masked_bbox_pred_tables_xyxy, fg_masked_obj_preds_tables)
+        constraint_loss = constraint_loss / num_fg
+
         loss_iou = (
-            self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets)
+            self.iou_loss(fg_masked_bbox_preds, reg_targets)
         ).sum() / num_fg
         loss_obj = (
-            self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets)
+            self.bcewithlog_loss(fg_masked_obj_preds, obj_targets)
         ).sum() / num_fg
         loss_cls = (
             self.bcewithlog_loss(
-                cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets
+                fg_masked_cls_preds, cls_targets
             )
         ).sum() / num_fg
         if self.use_l1:
@@ -401,7 +608,7 @@ class YOLOXHead(nn.Module):
             loss_l1 = 0.0
 
         reg_weight = 5.0
-        loss = reg_weight * loss_iou + loss_obj + loss_cls + loss_l1
+        loss = reg_weight * loss_iou + loss_obj + loss_cls + loss_l1 + constraint_loss
 
         return (
             loss,
@@ -409,6 +616,7 @@ class YOLOXHead(nn.Module):
             loss_obj,
             loss_cls,
             loss_l1,
+            constraint_loss,
             num_fg / max(num_gts, 1),
         )
 
