@@ -266,12 +266,12 @@ class YOLOXHead(nn.Module):
         Tensor: Converted bounding boxes of shape (N, 4), where each bounding box
             is defined as (x1, y1, x2, y2) also in normalized format.
         """
-        x1 = bboxes[:, 0] - 0.5 * bboxes[:, 2]
-        y1 = bboxes[:, 1] - 0.5 * bboxes[:, 3]
-        x2 = bboxes[:, 0] + 0.5 * bboxes[:, 2]
-        y2 = bboxes[:, 1] + 0.5 * bboxes[:, 3]
+        bboxes[:, 0] = bboxes[:, 0] - bboxes[:, 2] * 0.5
+        bboxes[:, 1] = bboxes[:, 1] - bboxes[:, 3] * 0.5
+        bboxes[:, 2] = bboxes[:, 0] + bboxes[:, 2]
+        bboxes[:, 3] = bboxes[:, 1] + bboxes[:, 3]
 
-        return torch.stack([x1, y1, x2, y2], dim=1)
+        return bboxes
 
     def normalized_areas_of_contained_bboxes(self, cell_tensor, table_tensor, modifier=0, bottom_modifier=0):
         """
@@ -587,7 +587,7 @@ class YOLOXHead(nn.Module):
         fg_masked_bbox_pred_tables_xyxy, fg_masked_high_conf_bbox_pred_cells_xyxy, fg_masked_obj_preds_tables = self.prep_tensors_for_constraint_loss(fg_masked_cls_preds, fg_masked_bbox_preds, fg_masked_obj_preds)
         # calculate the constraint loss
         constraint_loss = self.constraint_loss(fg_masked_high_conf_bbox_pred_cells_xyxy, fg_masked_bbox_pred_tables_xyxy, fg_masked_obj_preds_tables)
-        constraint_loss = constraint_loss / num_fg
+        constraint_loss = constraint_loss / num_fg 
 
         loss_iou = (
             self.iou_loss(fg_masked_bbox_preds, reg_targets)
